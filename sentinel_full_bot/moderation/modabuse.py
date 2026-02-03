@@ -226,7 +226,7 @@ class ModAbuseDetector(commands.Cog):
         max_actions_per_target = max(target_counts.values()) if target_counts else 0
         
         # Reason analysis
-        vague_keywords = ["spam", "bad", "no reason", "pls", "just because", "testing"]
+        vague_keywords = ["bad", "no reason", "pls", "just because", "testing"]
         vague_reasons = sum(1 for e in recent_day 
                            if any(kw in e.reason.lower() for kw in vague_keywords))
         vague_reasons_rate = vague_reasons / total_today if total_today > 0 else 0
@@ -465,10 +465,6 @@ class ModAbuseDetector(commands.Cog):
         
         # Owner can delete channels freely
         if deleter.id == OWNER_ID:
-            return
-        
-        # Bot actions are OK
-        if deleter.bot:
             return
 
         # Immediate trigger for protected channels
