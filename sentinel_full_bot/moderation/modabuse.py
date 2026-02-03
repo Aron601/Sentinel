@@ -514,11 +514,17 @@ class ModAbuseDetector(commands.Cog):
         self.quarantine_lockout = True
         
         try:
-            # 1. Demote all staff
-            await self._mass_demote_staff(guild, deleter)
+            # 1. Attempt to demote all staff (don't stop if this fails)
+            try:
+                await self._mass_demote_staff(guild, deleter)
+            except Exception as e:
+                print(f"[MASS DEMOTION ERROR] {e}")
             
-            # 2. Execute quarantine sequence
-            await self._execute_quarantine_sequence(guild, deleter, channel_name)
+            # 2. Execute quarantine sequence (ensure this runs even if demotion failed)
+            try:
+                await self._execute_quarantine_sequence(guild, deleter, channel_name)
+            except Exception as e:
+                print(f"[QUARANTINE ERROR] {_e if ( _e := e) else e}")
         finally:
             # Release lockout after 5 minutes
             await asyncio.sleep(300)
