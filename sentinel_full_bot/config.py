@@ -1,0 +1,18 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+QUARANTINE_ROLE = "Quarantined"
+
+SPAM_MSG_LIMIT = 5
+SPAM_TIME_WINDOW = 5
+SPAM_TIMEOUT_DURATION = 60
+
+OWNER_ID = 123456789012345678  # ← YOUR ID
+LOG_CHANNEL_ID = 1466641783105785886
+AUTO_RESTORE_MINUTES = 30     # set to None to disable auto-restore
+CONFIRM_TIMEOUT = 20          # seconds
+GUILD_ID = 969259122409218118  # ← YOUR GUILD ID
