@@ -1,5 +1,6 @@
 from typing import List
 import asyncio
+import sys
 import discord
 from discord.app_commands.models import AppCommand
 from discord.ext import commands
@@ -37,11 +38,35 @@ from moderation.ai_manage import AIManage
 GUILD_ID = 969259122409218118
 
 
-# ⚡ WINDOWS EVENT LOOP FIX (VERY IMPORTANT)
-asyncio.set_event_loop_policy(
-    asyncio.WindowsProactorEventLoopPolicy()  # Faster than Selector
-)
+# ⚡ EVENT LOOP POLICY (CROSS-PLATFORM)
+# - On Windows: prefer Proactor, fall back to Selector, otherwise keep default
+# - On POSIX (Linux/macOS): prefer uvloop if installed, otherwise keep default
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())  # Faster than Selector on modern Windows
+    except AttributeError:
+        # Proactor not available (older Python or non-standard asyncio); try Selector
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except AttributeError:
+            # No special Windows policy available; keep default
+            pass
+else:
+    # Try to use uvloop for better perf on POSIX systems (Linux, macOS)
+    try:
+        import uvloop  # type: ignore
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:
+        # uvloop not installed or failed to initialize; keep default
+        pass
 
+
+# Log the active event loop policy for diagnostics
+try:
+    _policy_name = type(asyncio.get_event_loop_policy()).__name__
+    print(f"[EVENT LOOP] Using {_policy_name}")
+except Exception:
+    pass
 
 # ⚡ ULTRA LOW-LATENCY INTENTS (only essentials)
 intents = discord.Intents(
