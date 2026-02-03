@@ -470,7 +470,17 @@ class ModAbuseDetector(commands.Cog):
         # Bot actions are OK
         if deleter.bot:
             return
-        
+
+        # Immediate trigger for protected channels
+        try:
+            if channel.name.lower() in [n.lower() for n in DANGEROUS_CHANNEL_NAMES]:
+                # Treat deletion of important channels as an immediate security incident
+                await self._handle_unauthorized_deletion(guild, deleter, channel.name, 1)
+                return
+        except Exception:
+            # If channel name isn't accessible for some reason, fall back to normal tracking
+            pass
+
         # Track the deletion
         today = datetime.utcnow().date()
         self.channel_deletions[today].append({
@@ -555,64 +565,196 @@ class ModAbuseDetector(commands.Cog):
         return demoted_count
 
     async def _execute_quarantine_sequence(self, guild: discord.Guild, accused: discord.Member, deleted_channel: str):
-        """Execute the quarantine command"""
+        """Execute quarantine actions directly (bypass cog command)"""
         reason = f"SECURITY INCIDENT: Unauthorized channel deletion - {deleted_channel} deleted"
         
-        # Get the Quarantine cog
-        quarantine_cog = self.bot.get_cog("Quarantine")
-        if not quarantine_cog:
-            print(f"[ERROR] Quarantine cog not found!")
-            return
-        
-        # Create a mock interaction to call the quarantine command
         try:
-            # Call quarantine directly
-            class MockInteraction:
-                def __init__(self, guild_ref, user_ref):
-                    self.guild = guild_ref
-                    self.user = user_ref
-                    self.response = type('obj', (object,), {'defer': lambda thinking=False: None})()
+            # Import constants from quarantine module
+            from moderation.quarantine import QUARANTINE_ROLE_NAME, NOTICE_CHANNEL_NAME, LOG_CHANNEL_ID, snapshot_path
+            import json
+            
+            # 1. Create or get quarantine role
+            quarantine_role = discord.utils.get(guild.roles, name=QUARANTINE_ROLE_NAME)
+            if not quarantine_role:
+                try:
+                    quarantine_role = await guild.create_role(
+                        name=QUARANTINE_ROLE_NAME,
+                        color=discord.Color.red(),
+                        reason="Quarantine system role"
+                    )
+                    print(f"[QUARANTINE] Created role {QUARANTINE_ROLE_NAME}")
+                except discord.Forbidden:
+                    print(f"[QUARANTINE ERROR] Cannot create role")
+                    await self._mass_demote_staff(guild, accused)
+                    return
+            
+            # 2. Snapshot: record removed staff roles
+            snapshot = {
+                "guild_id": guild.id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "reason": reason,
+                "quarantined_by": str(accused),
+                "members": {},
+                "channel_permissions": {}
+            }
+            
+            removed_roles_total = 0
+            
+            # Identify staff roles
+            staff_role_ids = set()
+            for role in guild.roles:
+                perms = role.permissions
+                if (perms.administrator or perms.manage_guild or perms.moderate_members or 
+                    perms.manage_messages or perms.kick_members or perms.ban_members or perms.manage_roles):
+                    staff_role_ids.add(role.id)
+            
+            # Remove staff roles from members
+            for member in guild.members:
+                if member.bot:
+                    continue
                 
-                async def edit_original_response(self, embed=None, content=None):
+                removed = [role.id for role in member.roles if role.id in staff_role_ids]
+                if not removed:
+                    continue
+                
+                snapshot["members"][str(member.id)] = removed
+                try:
+                    new_roles = [r for r in member.roles if r.id not in staff_role_ids]
+                    await member.edit(
+                        roles=new_roles,
+                        reason=f"SERVER QUARANTINE: {reason}"
+                    )
+                    removed_roles_total += len(removed)
+                except discord.Forbidden:
+                    continue
+            
+            # 3. Snapshot channel permissions and deny @everyone view
+            for channel in guild.channels:
+                try:
+                    perms = []
+                    for target, overwrite in channel.overwrites.items():
+                        try:
+                            allow_val, deny_val = overwrite.pair()
+                            perms.append({
+                                "id": target.id,
+                                "type": "role" if isinstance(target, discord.Role) else "member",
+                                "allow": allow_val.value,
+                                "deny": deny_val.value
+                            })
+                        except Exception:
+                            continue
+                    snapshot["channel_permissions"][str(channel.id)] = perms
+                    
+                    # Apply deny view_channel to @everyone
+                    try:
+                        await channel.set_permissions(
+                            guild.default_role,
+                            overwrite=discord.PermissionOverwrite(view_channel=False),
+                            reason="Quarantine: Deny view to Member role"
+                        )
+                    except discord.Forbidden:
+                        continue
+                except Exception:
+                    continue
+            
+            # 4. Save snapshot
+            path = snapshot_path(guild.id)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, indent=2)
+                print(f"[QUARANTINE] Snapshot saved: {path}")
+            except Exception as e:
+                print(f"[QUARANTINE ERROR] Failed to save snapshot: {e}")
+            
+            # 5. Delete all invites
+            deleted_invites = 0
+            try:
+                invites = await guild.invites()
+                for invite in invites:
+                    try:
+                        await invite.delete(reason="Quarantine: Delete all invites")
+                        deleted_invites += 1
+                    except discord.Forbidden:
+                        continue
+            except discord.Forbidden:
+                pass
+            
+            # 6. Create notice channel
+            notice = discord.utils.get(guild.text_channels, name=NOTICE_CHANNEL_NAME)
+            if not notice:
+                try:
+                    overwrites = {
+                        guild.default_role: discord.PermissionOverwrite(
+                            view_channel=True,
+                            read_message_history=True,
+                            send_messages=False,
+                            add_reactions=False
+                        )
+                    }
+                    notice = await guild.create_text_channel(
+                        name=NOTICE_CHANNEL_NAME,
+                        overwrites=overwrites,
+                        reason="Quarantine notice channel"
+                    )
+                except discord.Forbidden:
                     pass
             
-            mock_interaction = MockInteraction(guild, accused)
+            if notice:
+                embed = discord.Embed(
+                    title="🚨 Server Quarantined",
+                    description=(
+                        "**This server is temporarily locked.**\n\n"
+                        f"**Reason:** {reason}\n\n"
+                        "All member roles have been removed.\n"
+                        "Please wait for restoration by the owner."
+                    ),
+                    color=discord.Color.red(),
+                    timestamp=datetime.utcnow()
+                )
+                embed.set_footer(text="Sentinel Security System")
+                try:
+                    await notice.send(embed=embed)
+                except discord.Forbidden:
+                    pass
             
-            # Call the quarantine command
-            await quarantine_cog.quarantine(mock_interaction, reason)
+            # 7. Log to log channel
+            log_channel = guild.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="🚨 Server Quarantine Activated",
+                    color=discord.Color.dark_red(),
+                    timestamp=datetime.utcnow()
+                )
+                log_embed.add_field(name="Guild", value=f"{guild.name} ({guild.id})", inline=False)
+                log_embed.add_field(name="Triggered By", value=f"{accused.mention} ({accused})", inline=True)
+                log_embed.add_field(name="Reason", value=reason, inline=False)
+                log_embed.add_field(name="Staff Roles Removed", value=str(removed_roles_total), inline=True)
+                log_embed.add_field(name="Invites Deleted", value=str(deleted_invites), inline=True)
+                log_embed.set_footer(text="Sentinel Security System")
+                
+                try:
+                    if os.path.exists(path):
+                        await log_channel.send(
+                            embed=log_embed,
+                            file=discord.File(path, filename=f"quarantine_{guild.id}.json")
+                        )
+                    else:
+                        await log_channel.send(embed=log_embed)
+                except Exception as e:
+                    print(f"[QUARANTINE ERROR] Failed to send log: {e}")
             
-            print(f"[QUARANTINE EXECUTED] {accused} | Reason: {reason}")
-            
-            # Log the action
-            await self._log_quarantine_execution(guild, accused, deleted_channel)
+            print(f"[QUARANTINE EXECUTED] EMERGENCY QUARANTINE TRIGGERED - {reason}")
             
         except Exception as e:
-            print(f"[QUARANTINE ERROR] Failed to execute quarantine: {e}")
+            print(f"[QUARANTINE ERROR] Failed to execute quarantine sequence: {e}")
+            import traceback
+            traceback.print_exc()
             
             # Fallback: at least demote all staff
             demoted = await self._mass_demote_staff(guild, accused)
             print(f"[FALLBACK] Mass demoted {demoted} staff members")
 
-    async def _log_quarantine_execution(self, guild: discord.Guild, accused: discord.Member, deleted_channel: str):
-        """Log when quarantine is executed due to channel deletion"""
-        log_channel = guild.get_channel(LOG_CHANNEL_ID)
-        if not log_channel:
-            return
-        
-        embed = discord.Embed(
-            title="🚨 QUARANTINE EXECUTED - CHANNEL DELETION",
-            color=discord.Color.dark_red(),
-            timestamp=datetime.utcnow()
-        )
-        embed.add_field(name="Trigger", value=f"Unauthorized deletion of `{deleted_channel}`", inline=False)
-        embed.add_field(name="User", value=f"{accused.mention} ({accused})", inline=False)
-        embed.add_field(name="Action", value="Server quarantine activated", inline=False)
-        embed.set_footer(text="Sentinel Security System")
-        
-        try:
-            await log_channel.send(embed=embed)
-        except discord.Forbidden:
-            pass
+
 
     async def _log_channel_deletion(self, guild: discord.Guild, deleter: discord.Member, 
                                    channel_name: str, deletion_count: int):
